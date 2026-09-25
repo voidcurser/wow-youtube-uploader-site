@@ -15,7 +15,7 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
-from google.auth.exceptions import TransportError, RefreshError
+from google.auth.exceptions import TransportError
 import httplib2
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -251,69 +251,6 @@ def get_youtube():
         "v3",
         credentials=creds
     )
-
-
-# ============================================================
-# VISIBLE ERROR DIALOGS (the uploader normally runs via pythonw.exe)
-# ============================================================
-
-def show_error_dialog(title, message, retry=False):
-    """Show a topmost modal error even when no application window is open."""
-    dialog = tk.Tk()
-    dialog.withdraw()
-    dialog.attributes("-topmost", True)
-    try:
-        if retry:
-            return messagebox.askretrycancel(title, message, parent=dialog)
-        messagebox.showerror(title, message, parent=dialog)
-        return False
-    finally:
-        dialog.destroy()
-
-
-def connect_with_recovery():
-    """Offer reauthorization instead of silently exiting on an invalid token."""
-    while True:
-        try:
-            return get_youtube()
-        except RefreshError as exc:
-            logging.exception("Google authorization refresh failed")
-            invalid = "invalid_grant" in str(exc).lower()
-            if invalid:
-                retry = show_error_dialog(
-                    "YouTube Uploader - Google sign-in required",
-                    "Your Google authorization has expired or been revoked.\n\n"
-                    "Retry: back up the old token as token_old.json and open "
-                    "Google sign-in again.\nCancel: close the uploader without "
-                    "changing any recordings.",
-                    retry=True,
-                )
-                if not retry:
-                    raise
-                try:
-                    if os.path.isfile(TOKEN_FILE):
-                        os.replace(TOKEN_FILE, os.path.join(BASE_DIR, "token_old.json"))
-                except OSError as backup_error:
-                    logging.exception("Could not back up revoked OAuth token")
-                    show_error_dialog("YouTube Uploader - Token backup failed", str(backup_error))
-                    raise
-            elif not show_error_dialog(
-                "YouTube Uploader - Google authorization error",
-                f"Could not refresh Google authorization:\n{exc}\n\n"
-                "Check your connection and choose Retry, or Cancel to exit.",
-                retry=True,
-            ):
-                raise
-        except Exception as exc:
-            logging.exception("YouTube connection failed during startup")
-            if not show_error_dialog(
-                "YouTube Uploader - Startup error",
-                f"Could not connect to YouTube:\n{type(exc).__name__}: {exc}\n\n"
-                "Check your network or Google account. Retry to try again; "
-                "Cancel to exit. See uploader.log for details.",
-                retry=True,
-            ):
-                raise
 
 
 # ============================================================
@@ -613,24 +550,10 @@ Role: {role}
 
         if consecutive_failures > max_retries:
             logging.error(
-                "Upload error after %s automatic retries: %s - %s",
+                "Upload failed after %s consecutive retries: %s - %s",
                 max_retries, title, error
             )
-            retry = show_error_dialog(
-                "YouTube Uploader - Upload interrupted",
-                f"Upload interrupted: {title}\n\n"
-                f"{type(error).__name__}: {error}\n\n"
-                "Retry will continue the SAME in-memory resumable upload "
-                "request. Cancel keeps the MP4 and thumbnail for later.\n\n"
-                "If the video already appears in YouTube Studio, choose Cancel "
-                "to avoid starting another upload later.",
-                retry=True,
-            )
-            if not retry:
-                raise error
-            logging.info("User requested retry of current upload session: %s", title)
-            consecutive_failures = 0
-            continue
+            raise error
 
         delay = min(5 * (2 ** (consecutive_failures - 1)), 120)
         logging.warning(
@@ -1069,19 +992,10 @@ def show_title_popup(
             video_id = upload_video(
                 youtube, new_path, youtube_title, character, realm, selected_spec
             )
-        except Exception as exc:
+        except Exception:
             logging.exception("Video upload failed: %s", new_path)
             print("Video upload failed. Local MP4 and thumbnail were retained.")
             logging.error("Local MP4 and thumbnail retained for manual recovery: %s | %s", new_path, thumbnail_path)
-            show_error_dialog(
-                "YouTube Uploader - Upload not completed",
-                f"The upload of {youtube_title} stopped.\n\n"
-                f"{type(exc).__name__}: {exc}\n\n"
-                "The original MP4 and thumbnail were kept. Check YouTube "
-                "Studio before trying a NEW upload: the server may have "
-                "received the video even if confirmation was lost.\n\n"
-                "See uploader.log for details."
-            )
             return
 
         # The video was created. Record its ID BEFORE attempting the thumbnail;
@@ -1105,26 +1019,16 @@ def show_title_popup(
             )
             return
 
-        while True:
-            try:
-                upload_thumbnail(youtube, video_id, thumbnail_path)
-                break
-            except Exception as exc:
-                logging.exception(
-                    "Video %s uploaded, but thumbnail failed. Files retained.", video_id
-                )
-                retry = show_error_dialog(
-                    "YouTube Uploader - Thumbnail upload failed",
-                    f"The video is ALREADY uploaded:\n"
-                    f"https://www.youtube.com/watch?v={video_id}\n\n"
-                    f"Thumbnail error: {type(exc).__name__}: {exc}\n\n"
-                    "Retry uploads ONLY the thumbnail to this video. "
-                    "Cancel retains the MP4 and thumbnail; the thumbnail "
-                    "will be retried next time the uploader starts.",
-                    retry=True,
-                )
-                if not retry:
-                    return
+        try:
+            upload_thumbnail(youtube, video_id, thumbnail_path)
+        except Exception:
+            logging.exception(
+                "Video %s uploaded, but thumbnail failed. "
+                "Files retained; thumbnail will retry at next startup.", video_id
+            )
+            print(f"Video uploaded: https://www.youtube.com/watch?v={video_id}")
+            print("Thumbnail failed. Both local files retained for retry.")
+            return
 
         delete_after_thumbnail_success(record)
         try:
@@ -1273,7 +1177,7 @@ def main():
         "Connecting to YouTube..."
     )
 
-    youtube = connect_with_recovery()
+    youtube = get_youtube()
 
     retry_pending_thumbnails(youtube)
 
@@ -1359,15 +1263,5 @@ if __name__ == "__main__":
     )
     try:
         main()
-    except Exception as exc:
-        logging.exception("Uploader stopped due to an unexpected error")
-        show_error_dialog(
-            "YouTube Uploader - Stopped",
-            f"The uploader stopped: {type(exc).__name__}: {exc}\n\n"
-            "Your recordings have not been intentionally deleted. "
-            "See uploader.log for details. Restart the scheduled task "
-            "after resolving the error."
-        )
-        raise
     finally:
         ctypes.windll.kernel32.CloseHandle(mutex)
