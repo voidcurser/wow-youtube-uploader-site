@@ -1,0 +1,33 @@
+﻿# Google authentication
+client_secret.json
+token.json
+token_old.json
+*credentials*.json
+
+# Local application data
+uploaded.json
+settings.json
+pending_thumbnails.json
+
+# Logs
+*.log
+
+# Generated thumbnails and temporary files
+generated_thumbnails/
+__pycache__/
+*.pyc
+
+# Video recordings
+*.mp4
+*.mov
+*.avi
+
+# Old and temporary scripts
+uploader_.py
+uploader_._.py
+New Text Document.txt
+start_uploader.bat.txt
+
+# Windows
+Thumbs.db
+desktop.ini
