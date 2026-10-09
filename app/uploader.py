@@ -221,36 +221,61 @@ def get_tags(spec, character, realm):
 # YOUTUBE AUTHENTICATION
 # ============================================================
 
+def _save_token(creds):
+    """Write OAuth credentials atomically so a crash cannot corrupt token.json."""
+    temp_file = TOKEN_FILE + ".tmp"
+    with open(temp_file, "w", encoding="utf-8") as token:
+        token.write(creds.to_json())
+    os.replace(temp_file, TOKEN_FILE)
+
+
+def _backup_invalid_token():
+    """Keep a revoked token for diagnostics without blocking a fresh login."""
+    if not os.path.isfile(TOKEN_FILE):
+        return
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = os.path.join(BASE_DIR, f"token_revoked_{stamp}.json")
+    os.replace(TOKEN_FILE, backup)
+    logging.warning("Revoked Google OAuth token moved to %s", backup)
+
+
 def get_youtube():
     creds = None
 
     if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(
-            TOKEN_FILE,
-            SCOPES
-        )
+        try:
+            creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+        except (ValueError, json.JSONDecodeError, OSError):
+            logging.exception("Saved Google OAuth token could not be loaded")
+            _backup_invalid_token()
+            creds = None
+
+    if creds and not creds.valid and creds.expired and creds.refresh_token:
+        try:
+            # Normal path after the one-time login: refresh silently.
+            creds.refresh(Request())
+            _save_token(creds)
+            logging.info("Google OAuth access token refreshed silently")
+        except RefreshError as exc:
+            if "invalid_grant" not in str(exc).lower():
+                raise
+            # Revoked/expired refresh token: discard it and perform one new consent flow.
+            logging.warning("Google OAuth refresh token is no longer valid; starting one-time reauthorization")
+            _backup_invalid_token()
+            creds = None
 
     if not creds or not creds.valid:
+        flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, SCOPES)
+        # Force offline consent on recovery so Google returns a reusable refresh token.
+        creds = flow.run_local_server(
+            port=0,
+            access_type="offline",
+            prompt="consent",
+        )
+        _save_token(creds)
+        logging.info("Google OAuth authorization saved successfully")
 
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                CLIENT_SECRET_FILE,
-                SCOPES
-            )
-
-            creds = flow.run_local_server(port=0)
-
-        with open(TOKEN_FILE, "w") as token:
-            token.write(creds.to_json())
-
-    return build(
-        "youtube",
-        "v3",
-        credentials=creds
-    )
+    return build("youtube", "v3", credentials=creds)
 
 
 # ============================================================
