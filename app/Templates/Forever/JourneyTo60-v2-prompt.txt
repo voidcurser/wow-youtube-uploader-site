@@ -1,0 +1,16 @@
+Background generated with the built-in imagegen tool.
+The approved background is kept unchanged. The actual Blizzard transparent logo is layered onto it by build_journey_v2.py, without AI redrawing the logo.
+
+Background prompt:
+Use case: stylized-concept. Generate ONE wide 16:9 reusable YouTube thumbnail BACKGROUND ONLY for a World of Warcraft: Forever journey to level 60. Reference image 1 (Ashenvale) is the PRIMARY reference for the actual in-game graphics: match its chunky early-World-of-Warcraft 3D geometry, obviously hand-painted low-resolution diffuse textures, broad simple rounded foliage clusters, angular rock models, oversized gnarled trunks, stylized terrain, softly fogged draw distance and nonphotorealistic rasterized game-engine lighting. Reference image 2 (Mulgore) supports the same classic engine material and landscape treatment. This should look like an attractive clean in-engine Forever landscape screenshot, not highly detailed fantasy key art, not a modern Unreal Engine render, not a matte painting or illustration. Scene: an inviting winding dirt leveling path through an ancient Azeroth forest inspired by the Ashenvale reference. On the LEFT half, big low-poly twisting oak trunks and roots, round clusters of olive and muted purple foliage, a small simple cozy adventurer campfire made from a few angular rocks and logs beside the path in lower-left, and a distant little rustic timber waystation partly hidden by trees. A little pale fog, softly glowing sunrise through leaves, deep shadowed undergrowth, dappled restrained golden light; classic green, earthy brown, lavender haze, soft blue distant terrain. Keep geometry, texture density, proportions and shading recognizably from the classic Warcraft engine in the reference, rather than realistically detailed. No characters, creatures, weapons, armor, faction emblems, Alliance/Horde banners or named-character references. Composition: visual interest and readable depth on left 55 percent, path leads into center-left distance. RIGHT 45 percent naturally becomes a low-detail darker forest wall with mist and dark moss-green shadows so a thumbnail title can be added later. Preserve dark clean negative space across upper-right for an original logo to be composited by code, and middle/lower-right for 2-3 lines of big episode text. DO NOT RENDER ANY LOGO, LETTERING, TITLE, WORDS, NUMBERS, RUNES, FRAMES OR UI anywhere. The authentic official transparent logo will be placed afterward; do not invent it. No cinematic hyperreal stone detail, no towering modern fantasy castle, no lens effects, no epic painted sky, no shiny metal. One cohesive beautiful classic-game environment, screenshot-like, 16:9.
+
+Official logo source:
+https://blz-contentstack-images.akamaized.net/v3/assets/blt9c12f249ac15c7ec/blt527dd61848a757c7/6aa3316cad92093ee45628fd/camelot-logo-gamepage.png
+Source page: https://worldofwarcraft.blizzard.com/en-us/forever
+
+Environment reference gallery: https://wowforever.one/screenshots/
+Primary style reference: https://wowforever.one/_astro/Updates_Ashenvale_01.CntZtP99_Zkbaw5.webp
+Supporting style reference: https://wowforever.one/_astro/Updates_Mulgore.CcasYEd0_Z1uKNAN.webp
+
+No character, name, episode title, level range, or faction is baked into the background.
+Not connected to the uploader yet.

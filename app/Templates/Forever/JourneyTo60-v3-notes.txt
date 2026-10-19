@@ -1,0 +1,12 @@
+Revision of the approved v2 background and original Blizzard logo.
+
+User request: blend the logo into the environment, reduce its brightness, and move it closer to the corner.
+
+The generated forest background remains unchanged. The official source logo is
+resized proportionally, softened slightly, given reduced brightness and saturation
+with restrained warmth, and composited near the top-right corner. No lettering,
+crest details, or infinity symbol is redrawn. Original v2 files are preserved.
+
+Rebuild: run build_journey_v3.py with Pillow installed.
+Background generation prompt and image sources: JourneyTo60-v2-prompt.txt.
+No new AI image generation was needed for this adjustment to the existing composer.

@@ -6,6 +6,7 @@ import json
 import threading
 import uuid
 import logging
+from contextlib import closing
 import tkinter as tk
 from tkinter import messagebox, ttk
 
@@ -20,7 +21,10 @@ import httplib2
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-from thumbnail_generator import generate_thumbnail
+from thumbnail_generator import (
+    generate_thumbnail, generate_generic_thumbnail, get_generic_template,
+    render_generic_thumbnail, normalize_headline, GENERIC_HEADLINE_LIMIT,
+)
 
 
 # ============================================================
@@ -36,6 +40,10 @@ WOW_ACCOUNT_FOLDER = os.path.join(
     "WTF",
     "Account"
 )
+WOW_FOREVER_ACCOUNT_FOLDER = os.path.join(
+    os.path.dirname(WOW_RETAIL_FOLDER), "_forever_", "WTF", "Account"
+)
+GAME_LABELS = {"WoW Retail": "retail", "WoW Forever": "forever"}
 
 CLIENT_SECRET_FILE = os.path.join(BASE_DIR, "client_secret.json")
 TOKEN_FILE = os.path.join(BASE_DIR, "token.json")
@@ -166,17 +174,17 @@ def get_role_from_spec(spec):
     return "DPS"
 
 
-def get_hashtags(spec):
+def get_hashtags(spec, mythic_plus=True, game_version="retail"):
+    hashtags = ["#WorldOfWarcraft", "#WoW"]
+    if spec:
+        hashtags.append("#" + spec.replace(" ", ""))
+    if game_version == "forever":
+        hashtags.extend(["#WoWForever", "#JourneyTo60", "#WoWLeveling"])
+    else:
+        hashtags.append("#MythicPlus" if mythic_plus else "#WoWGameplay")
+    if spec not in SPECS:
+        return " ".join(hashtags)
     role = get_role_from_spec(spec)
-
-    spec_hashtag = "#" + spec.replace(" ", "")
-
-    hashtags = [
-        "#WorldOfWarcraft",
-        "#WoW",
-        spec_hashtag,
-        "#MythicPlus",
-    ]
 
     if role == "Healer":
         hashtags.append("#HealerPOV")
@@ -190,31 +198,46 @@ def get_hashtags(spec):
     return " ".join(hashtags)
 
 
-def get_tags(spec, character, realm):
-    role = get_role_from_spec(spec)
-
+def get_tags(spec, character, realm, mythic_plus=True, game_version="retail"):
     tags = [
         "World of Warcraft",
         "WoW",
-        "World of Warcraft Midnight",
-        "WoW Midnight",
-        "Mythic Plus",
-        "Mythic+",
-        spec,
-        character,
-        realm,
         "WoW Gameplay",
         "WoW POV",
-        f"{role} POV",
     ]
-
-    # Add class name separately
-    class_name = spec.split(" ")[-1]
-
-    if class_name not in tags:
-        tags.append(class_name)
+    if game_version == "forever":
+        tags.extend(["World of Warcraft Forever", "WoW Forever", "Journey to 60", "WoW Leveling"])
+    else:
+        tags.extend(["World of Warcraft Midnight", "WoW Midnight"])
+    tags.extend(value for value in (character, realm) if value)
+    if mythic_plus and game_version == "retail":
+        tags.extend(["Mythic Plus", "Mythic+"])
+    if spec:
+        tags.append(spec)
+        if spec in SPECS:
+            tags.append(f"{get_role_from_spec(spec)} POV")
+        class_name = spec.rsplit(" ", 1)[-1]
+        if class_name not in tags:
+            tags.append(class_name)
 
     return tags
+
+
+def build_description(character, realm, spec, notes="", mythic_plus=True, game_version="retail"):
+    details = []
+    if character:
+        details.append(f"Character: {character}")
+    if realm:
+        details.append(f"Realm: {realm}")
+    if spec:
+        details.append(f"Spec: {spec}")
+        if spec in SPECS:
+            details.append(f"Role: {get_role_from_spec(spec)}")
+    gameplay = ("World of Warcraft: Forever gameplay.\nJourney to level 60."
+                if game_version == "forever" else "World of Warcraft gameplay.")
+    sections = [notes.strip(), gameplay, "\n".join(details),
+                get_hashtags(spec, mythic_plus=mythic_plus, game_version=game_version)]
+    return "\n\n".join(section for section in sections if section) + "\n"
 
 
 # ============================================================
@@ -350,7 +373,9 @@ def load_settings():
         "last_character": "",
         "character_specs": {},
         "last_dungeon": "",
-        "last_key_level": "12"
+        "last_key_level": "12",
+        "last_game_version": "retail",
+        "forever": {"last_character": "", "character_specs": {}},
     }
 
     if not os.path.exists(SETTINGS_FILE):
@@ -391,17 +416,19 @@ def save_settings(settings):
 # CHARACTER SCANNING
 # ============================================================
 
-def get_wow_characters():
+def get_wow_characters(game_version="retail"):
     characters = []
-
-    if not os.path.exists(WOW_ACCOUNT_FOLDER):
-        print("WoW Account folder not found.")
+    if game_version not in GAME_LABELS.values():
+        raise ValueError("Please select WoW Retail or WoW Forever.")
+    account_folder = WOW_FOREVER_ACCOUNT_FOLDER if game_version == "forever" else WOW_ACCOUNT_FOLDER
+    if not os.path.exists(account_folder):
+        print(f"WoW {game_version} Account folder not found.")
         return characters
 
-    for account_name in os.listdir(WOW_ACCOUNT_FOLDER):
+    for account_name in os.listdir(account_folder):
 
         account_path = os.path.join(
-            WOW_ACCOUNT_FOLDER,
+            account_folder,
             account_name
         )
 
@@ -553,29 +580,27 @@ def upload_video(
     title,
     character,
     realm,
-    spec
+    spec,
+    notes="",
+    mythic_plus=True,
+    game_version="retail",
 ):
+    if game_version not in GAME_LABELS.values():
+        raise ValueError("Please select WoW Retail or WoW Forever.")
+    if game_version == "forever":
+        mythic_plus = False
     print()
     print(f"Uploading: {title}")
     logging.info("Starting video upload: %s - %s", title, file_path)
 
-    role = get_role_from_spec(spec)
-    hashtags = get_hashtags(spec)
     tags = get_tags(
         spec,
         character,
-        realm
+        realm,
+        mythic_plus=mythic_plus,
+        game_version=game_version,
     )
-
-    description = f"""World of Warcraft gameplay.
-
-Character: {character}
-Realm: {realm}
-Spec: {spec}
-Role: {role}
-
-{hashtags}
-"""
+    description = build_description(character, realm, spec, notes, mythic_plus, game_version)
 
     body = {
         "snippet": {
@@ -586,7 +611,7 @@ Role: {role}
         },
 
         "status": {
-            "privacyStatus": "private"
+            "privacyStatus": "public"
         }
     }
 
@@ -599,73 +624,77 @@ Role: {role}
         resumable=True
     )
 
-    request = youtube.videos().insert(
-        part="snippet,status",
-        body=body,
-        media_body=media
-    )
-
-    response = None
-    consecutive_failures = 0
-    max_retries = 6
-
-    while response is None:
-        try:
-            # Retry the SAME resumable request, never create a second insert
-            # request automatically. The library checks the server's position
-            # when recovering from a transport error.
-            status, response = request.next_chunk()
-            consecutive_failures = 0
-        except HttpError as exc:
-            # Most 4xx errors (auth, quota, permissions, invalid requests)
-            # are not transient. Retrying them just wastes time/quota.
-            if exc.resp.status not in (408, 429, 500, 502, 503, 504):
-                logging.exception("Permanent YouTube upload HTTP error")
-                raise
-            consecutive_failures += 1
-            error = exc
-        except (OSError, httplib2.HttpLib2Error, TransportError) as exc:
-            # Includes WinError 10053/10054, timeouts, SSL/socket errors,
-            # and temporary failures while refreshing an access token.
-            consecutive_failures += 1
-            error = exc
-        else:
-            if status:
-                progress = int(status.progress() * 100)
-                logging.info("Upload progress: %s%% - %s", progress, title)
-                print(f"Upload progress: {progress}%")
-            continue
-
-        if consecutive_failures > max_retries:
-            logging.error(
-                "Upload error after %s automatic retries: %s - %s",
-                max_retries, title, error
-            )
-            retry = show_error_dialog(
-                "YouTube Uploader - Upload interrupted",
-                f"Upload interrupted: {title}\n\n"
-                f"{type(error).__name__}: {error}\n\n"
-                "Retry will continue the SAME in-memory resumable upload "
-                "request. Cancel keeps the MP4 and thumbnail for later.\n\n"
-                "If the video already appears in YouTube Studio, choose Cancel "
-                "to avoid starting another upload later.",
-                retry=True,
-            )
-            if not retry:
-                raise error
-            logging.info("User requested retry of current upload session: %s", title)
-            consecutive_failures = 0
-            continue
-
-        delay = min(5 * (2 ** (consecutive_failures - 1)), 120)
-        logging.warning(
-            "Temporary upload error (%s: %s). Retry %s/%s in %ss: %s",
-            type(error).__name__, error,
-            consecutive_failures, max_retries, delay, title
+    # Close explicitly on success and failure. Requests/tracebacks may retain
+    # media references, so its destructor cannot reliably release Windows locks.
+    # Keep the stream open throughout retries of this same resumable session.
+    with closing(media.stream()):
+        request = youtube.videos().insert(
+            part="snippet,status",
+            body=body,
+            media_body=media
         )
-        time.sleep(delay)
 
-    video_id = response["id"]
+        response = None
+        consecutive_failures = 0
+        max_retries = 6
+
+        while response is None:
+            try:
+                # Retry the SAME resumable request, never create a second insert
+                # request automatically. The library checks the server's position
+                # when recovering from a transport error.
+                status, response = request.next_chunk()
+                consecutive_failures = 0
+            except HttpError as exc:
+                # Most 4xx errors (auth, quota, permissions, invalid requests)
+                # are not transient. Retrying them just wastes time/quota.
+                if exc.resp.status not in (408, 429, 500, 502, 503, 504):
+                    logging.exception("Permanent YouTube upload HTTP error")
+                    raise
+                consecutive_failures += 1
+                error = exc
+            except (OSError, httplib2.HttpLib2Error, TransportError) as exc:
+                # Includes WinError 10053/10054, timeouts, SSL/socket errors,
+                # and temporary failures while refreshing an access token.
+                consecutive_failures += 1
+                error = exc
+            else:
+                if status:
+                    progress = int(status.progress() * 100)
+                    logging.info("Upload progress: %s%% - %s", progress, title)
+                    print(f"Upload progress: {progress}%")
+                continue
+
+            if consecutive_failures > max_retries:
+                logging.error(
+                    "Upload error after %s automatic retries: %s - %s",
+                    max_retries, title, error
+                )
+                retry = show_error_dialog(
+                    "YouTube Uploader - Upload interrupted",
+                    f"Upload interrupted: {title}\n\n"
+                    f"{type(error).__name__}: {error}\n\n"
+                    "Retry will continue the SAME in-memory resumable upload "
+                    "request. Cancel keeps the MP4 and thumbnail for later.\n\n"
+                    "If the video already appears in YouTube Studio, choose Cancel "
+                    "to avoid starting another upload later.",
+                    retry=True,
+                )
+                if not retry:
+                    raise error
+                logging.info("User requested retry of current upload session: %s", title)
+                consecutive_failures = 0
+                continue
+
+            delay = min(5 * (2 ** (consecutive_failures - 1)), 120)
+            logging.warning(
+                "Temporary upload error (%s: %s). Retry %s/%s in %ss: %s",
+                type(error).__name__, error,
+                consecutive_failures, max_retries, delay, title
+            )
+            time.sleep(delay)
+
+        video_id = response["id"]
 
     print()
     print("Upload complete.")
@@ -695,12 +724,12 @@ def save_pending_thumbnails(pending):
 
 
 def upload_thumbnail(youtube, video_id, thumbnail_path):
-    youtube.thumbnails().set(
-        videoId=video_id,
-        media_body=MediaFileUpload(
-            thumbnail_path, mimetype="image/jpeg", resumable=False
-        ),
-    ).execute()
+    media = MediaFileUpload(thumbnail_path, mimetype="image/jpeg", resumable=False)
+    with closing(media.stream()):
+        youtube.thumbnails().set(
+            videoId=video_id,
+            media_body=media,
+        ).execute()
     print(f"Custom thumbnail uploaded for video {video_id}")
 
 
@@ -743,8 +772,13 @@ def show_title_popup(
     youtube,
     uploaded
 ):
-    characters = get_wow_characters()
     settings = load_settings()
+    initial_game = settings.get("last_game_version", "retail")
+    if initial_game not in GAME_LABELS.values():
+        initial_game = "retail"
+    characters = get_wow_characters(initial_game)
+    active_game = None
+    game_drafts = {}
 
     root = tk.Tk()
 
@@ -753,7 +787,7 @@ def show_title_popup(
     )
 
     root.geometry(
-        "620x470"
+        "620x630"
     )
 
     root.resizable(
@@ -768,6 +802,7 @@ def show_title_popup(
 
     root.lift()
     root.focus_force()
+    general_mode = tk.BooleanVar(root, value=False)
 
 
     # HEADER
@@ -784,6 +819,22 @@ def show_title_popup(
         pady=(15, 12)
     )
 
+    game_frame = tk.Frame(root)
+    game_frame.pack(pady=(0, 12))
+    tk.Label(game_frame, text="Game:").pack(side="left", padx=(0, 8))
+    game_var = tk.StringVar(root, value=next(label for label, key in GAME_LABELS.items() if key == initial_game))
+    game_combo = ttk.Combobox(game_frame, name="game_version", textvariable=game_var,
+                              values=list(GAME_LABELS), state="readonly", width=24)
+    game_combo.pack(side="left")
+
+    def selected_game():
+        return GAME_LABELS[game_var.get()]
+
+    def character_profile():
+        if selected_game() == "retail":
+            return settings
+        return settings.setdefault("forever", {"last_character": "", "character_specs": {}})
+
 
     # TITLE
 
@@ -792,8 +843,10 @@ def show_title_popup(
         text="Video title:"
     ).pack()
 
+    title_var = tk.StringVar(root)
     title_entry = tk.Entry(
         root,
+        textvariable=title_var,
         font=(
             "Segoe UI",
             11
@@ -808,10 +861,11 @@ def show_title_popup(
 
     # CHARACTER
 
-    tk.Label(
+    character_label = tk.Label(
         root,
         text="Character:"
-    ).pack()
+    )
+    character_label.pack()
 
     character_values = [
         x["display"]
@@ -832,10 +886,11 @@ def show_title_popup(
 
     # SPEC
 
-    tk.Label(
+    spec_label = tk.Label(
         root,
         text="Spec:"
-    ).pack()
+    )
+    spec_label.pack()
 
     spec_combo = ttk.Combobox(
         root,
@@ -851,9 +906,11 @@ def show_title_popup(
 
     # DUNGEON
 
-    tk.Label(root, text="Dungeon:").pack()
+    mythic_frame = tk.Frame(root)
+    mythic_frame.pack()
+    tk.Label(mythic_frame, text="Dungeon:").pack()
     dungeon_combo = ttk.Combobox(
-        root, values=[name for name, _ in DUNGEONS],
+        mythic_frame, values=[name for name, _ in DUNGEONS],
         state="readonly", width=55
     )
     dungeon_combo.pack(pady=(5, 10))
@@ -863,16 +920,77 @@ def show_title_popup(
 
     # KEY LEVEL
 
-    tk.Label(root, text="Mythic+ key level:").pack()
-    key_entry = tk.Spinbox(root, from_=2, to=99, width=8, font=("Segoe UI", 11))
+    tk.Label(mythic_frame, text="Mythic+ key level:").pack()
+    key_entry = tk.Spinbox(mythic_frame, from_=2, to=99, width=8, font=("Segoe UI", 11))
     key_entry.pack(pady=(5, 10))
     key_entry.delete(0, tk.END)
     key_entry.insert(0, str(settings.get("last_key_level", "12")))
 
+    general_frame = tk.Frame(root)
+    tk.Label(general_frame, text="Description (optional):").pack()
+    description_entry = tk.Text(general_frame, width=64, height=3, wrap="word")
+    description_entry.pack(pady=(5, 8))
+    tk.Label(general_frame, text="Thumbnail headline (optional; uses video title if blank):").pack()
+    headline_var = tk.StringVar(root)
+    headline_entry = tk.Entry(general_frame, textvariable=headline_var, width=60,
+                              font=("Segoe UI", 11))
+    headline_entry.pack(pady=(5, 3))
+    headline_hint = tk.Label(general_frame, wraplength=550)
+    headline_hint.pack()
+    thumbnail_status = tk.Label(general_frame, wraplength=550)
+    thumbnail_status.pack(pady=(4, 4))
+
+    def selected_character_name():
+        return next((item["character"] for item in characters
+                     if item["display"] == character_combo.get()), "")
+
+    def effective_headline():
+        return normalize_headline(headline_var.get().strip() or title_entry.get())
+
+    def update_headline_hint(*_):
+        count = len(effective_headline())
+        headline_hint.config(
+            text=f"{count}/{GENERIC_HEADLINE_LIMIT} characters · Up to 3 lines · Aim for 20–45 characters",
+            fg="#B42318" if count > GENERIC_HEADLINE_LIMIT else "#555555",
+        )
+
+    def update_thumbnail_status():
+        available = bool(get_generic_template(selected_character_name(), selected_game()))
+        headline_entry.config(state="normal" if available else "disabled")
+        preview_button.config(state="normal" if available else "disabled")
+        if selected_game() == "forever":
+            status = ("Forever: Journey to 60 thumbnail and hashtags. Character artwork can be added later."
+                      if available else "Forever thumbnail is missing. Restore the approved template before uploading.")
+        else:
+            status = ("Character thumbnail available. WoW hashtags are added automatically."
+                      if available else "No generic template for this character yet. Uploads without a custom thumbnail.")
+        thumbnail_status.config(text=status)
+        update_headline_hint()
+
+    def preview_thumbnail():
+        from PIL import ImageTk
+        try:
+            image = render_generic_thumbnail(selected_character_name(), effective_headline(), selected_game())
+        except (ValueError, OSError) as exc:
+            messagebox.showwarning("Thumbnail headline", str(exc), parent=root)
+            return
+        preview = tk.Toplevel(root)
+        preview.title("Thumbnail preview")
+        preview.attributes("-topmost", True)
+        preview_image = ImageTk.PhotoImage(image.resize((960, 540)), master=preview)
+        label = tk.Label(preview, image=preview_image)
+        label.image = preview_image
+        label.pack()
+
+    preview_button = tk.Button(general_frame, text="Preview thumbnail", command=preview_thumbnail)
+    preview_button.pack(pady=(0, 8))
+    headline_var.trace_add("write", update_headline_hint)
+    title_var.trace_add("write", update_headline_hint)
+
 
     # DEFAULT CHARACTER
 
-    last_character = settings.get(
+    last_character = character_profile().get(
         "last_character",
         ""
     )
@@ -897,7 +1015,7 @@ def show_title_popup(
             character_combo.get()
         )
 
-        remembered_specs = settings.get(
+        remembered_specs = character_profile().get(
             "character_specs",
             {}
         )
@@ -910,14 +1028,16 @@ def show_title_popup(
 
         if (
             remembered_spec
-            and remembered_spec in SPECS
+            and (remembered_spec in SPECS or selected_game() == "forever")
         ):
             spec_combo.set(
                 remembered_spec
             )
 
         else:
-            spec_combo.set("")
+            spec_combo.set(character_profile().get("last_spec", "")
+                           if selected_game() == "forever" and not selected_character else "")
+        update_thumbnail_status()
 
 
     character_combo.bind(
@@ -942,22 +1062,26 @@ def show_title_popup(
         )
 
         selected_spec = (
-            spec_combo.get()
+            spec_combo.get().strip()
         )
 
         selected_dungeon = dungeon_combo.get()
         key_raw = key_entry.get().strip()
-        if selected_dungeon not in DUNGEON_IDS:
-            messagebox.showwarning("Missing dungeon", "Please select a dungeon.")
-            return
-        try:
-            key_level = int(key_raw)
-            if not 2 <= key_level <= 99:
-                raise ValueError()
-        except ValueError:
-            messagebox.showwarning("Invalid key", "Enter a key level from 2 to 99.")
-            return
-        dungeon_id = DUNGEON_IDS[selected_dungeon]
+        game_version = selected_game()
+        is_forever = game_version == "forever"
+        is_general = general_mode.get() or is_forever
+        if not is_general:
+            if selected_dungeon not in DUNGEON_IDS:
+                messagebox.showwarning("Missing dungeon", "Please select a dungeon.")
+                return
+            try:
+                key_level = int(key_raw)
+                if not 2 <= key_level <= 99:
+                    raise ValueError()
+            except ValueError:
+                messagebox.showwarning("Invalid key", "Enter a key level from 2 to 99.")
+                return
+            dungeon_id = DUNGEON_IDS[selected_dungeon]
 
         if not base_title:
 
@@ -968,7 +1092,7 @@ def show_title_popup(
 
             return
 
-        if not selected_character:
+        if not selected_character and not is_forever:
 
             messagebox.showwarning(
                 "Missing character",
@@ -977,7 +1101,7 @@ def show_title_popup(
 
             return
 
-        if not selected_spec:
+        if not selected_spec and not is_general:
 
             messagebox.showwarning(
                 "Missing spec",
@@ -995,7 +1119,7 @@ def show_title_popup(
             None
         )
 
-        if not character_data:
+        if not character_data and (selected_character or not is_forever):
 
             messagebox.showerror(
                 "Character error",
@@ -1004,38 +1128,35 @@ def show_title_popup(
 
             return
 
-        character = (
-            character_data["character"]
-        )
-
-        realm = (
-            character_data["realm"]
-        )
+        character = character_data["character"] if character_data else ""
+        realm = character_data["realm"] if character_data else ""
 
         youtube_title = (
             f"{base_title} | "
             f"{character} | "
             f"{selected_spec}"
-        )
+        ) if not is_general else base_title
+        if len(youtube_title) > 100:
+            messagebox.showwarning("Title too long", "The full YouTube title must be 100 characters or fewer.")
+            return
+        notes = description_entry.get("1.0", "end-1c").strip() if is_general else ""
+        if len(notes) > 2000:
+            messagebox.showwarning("Description too long", "Keep your description to 2,000 characters or fewer.")
+            return
 
-        settings["last_character"] = (
-            selected_character
-        )
-
-        if "character_specs" not in settings:
-            settings["character_specs"] = {}
-
-        settings[
-            "character_specs"
-        ][
-            selected_character
-        ] = selected_spec
-
-        settings["last_dungeon"] = selected_dungeon
-        settings["last_key_level"] = str(key_level)
-        save_settings(
-            settings
-        )
+        settings["last_game_version"] = game_version
+        profile = character_profile()
+        profile["last_character"] = selected_character
+        if selected_spec:
+            if selected_character:
+                profile.setdefault("character_specs", {})[selected_character] = selected_spec
+        if is_forever:
+            profile["last_spec"] = selected_spec
+            if selected_character and not selected_spec:
+                profile.setdefault("character_specs", {}).pop(selected_character, None)
+        if not is_general:
+            settings["last_dungeon"] = selected_dungeon
+            settings["last_key_level"] = str(key_level)
 
         safe_filename = clean_filename(
             youtube_title
@@ -1050,21 +1171,27 @@ def show_title_popup(
 
         # Prepare thumbnail BEFORE uploading so missing assets don't create
         # a video without its requested thumbnail. Do not touch base templates.
+        thumbnail_path = None
         try:
-            thumbnail_path = generate_thumbnail(
-                character=character,
-                dungeon=dungeon_id,
-                key_level=key_level,
-                spec=selected_spec,
-            )
+            if is_general:
+                if is_forever or get_generic_template(character, game_version):
+                    thumbnail_path = generate_generic_thumbnail(character, effective_headline(), game_version)
+            else:
+                thumbnail_path = generate_thumbnail(
+                    character=character,
+                    dungeon=dungeon_id,
+                    key_level=key_level,
+                    spec=selected_spec,
+                )
             # The generator uses a predictable filename; give this recording
             # its own filename so a later recording can't overwrite a pending one.
-            unique_thumb_path = os.path.join(
-                os.path.dirname(thumbnail_path),
-                f"upload_{uuid.uuid4().hex}.jpg",
-            )
-            os.replace(thumbnail_path, unique_thumb_path)
-            thumbnail_path = unique_thumb_path
+            if thumbnail_path and not is_general:
+                unique_thumb_path = os.path.join(
+                    os.path.dirname(thumbnail_path),
+                    f"upload_{uuid.uuid4().hex}.jpg",
+                )
+                os.replace(thumbnail_path, unique_thumb_path)
+                thumbnail_path = unique_thumb_path
         except Exception as e:
             logging.exception("Thumbnail generation failed")
             messagebox.showerror(
@@ -1075,6 +1202,7 @@ def show_title_popup(
             return
 
         try:
+            save_settings(settings)
             if new_path != file_path:
                 if os.path.exists(new_path):
                     messagebox.showerror(
@@ -1092,17 +1220,19 @@ def show_title_popup(
         root.destroy()
         try:
             video_id = upload_video(
-                youtube, new_path, youtube_title, character, realm, selected_spec
+                youtube, new_path, youtube_title, character, realm, selected_spec,
+                notes=notes, mythic_plus=not is_general,
+                game_version=game_version,
             )
         except Exception as exc:
             logging.exception("Video upload failed: %s", new_path)
-            print("Video upload failed. Local MP4 and thumbnail were retained.")
-            logging.error("Local MP4 and thumbnail retained for manual recovery: %s | %s", new_path, thumbnail_path)
+            print("Video upload failed. Local files were retained.")
+            logging.error("Local files retained for manual recovery: %s | %s", new_path, thumbnail_path)
             show_error_dialog(
                 "YouTube Uploader - Upload not completed",
                 f"The upload of {youtube_title} stopped.\n\n"
                 f"{type(exc).__name__}: {exc}\n\n"
-                "The original MP4 and thumbnail were kept. Check YouTube "
+                "The local recording and any generated thumbnail were kept. Check YouTube "
                 "Studio before trying a NEW upload: the server may have "
                 "received the video even if confirmation was lost.\n\n"
                 "See uploader.log for details."
@@ -1116,9 +1246,10 @@ def show_title_popup(
             "thumbnail_path": thumbnail_path,
         }
         try:
-            pending = load_pending_thumbnails()
-            pending[video_id] = record
-            save_pending_thumbnails(pending)
+            if thumbnail_path:
+                pending = load_pending_thumbnails()
+                pending[video_id] = record
+                save_pending_thumbnails(pending)
             if new_path not in uploaded:
                 uploaded.append(new_path)
                 save_uploaded(uploaded)
@@ -1130,7 +1261,7 @@ def show_title_popup(
             )
             return
 
-        while True:
+        while thumbnail_path:
             try:
                 upload_thumbnail(youtube, video_id, thumbnail_path)
                 break
@@ -1153,9 +1284,10 @@ def show_title_popup(
 
         delete_after_thumbnail_success(record)
         try:
-            pending = load_pending_thumbnails()
-            pending.pop(video_id, None)
-            save_pending_thumbnails(pending)
+            if thumbnail_path:
+                pending = load_pending_thumbnails()
+                pending.pop(video_id, None)
+                save_pending_thumbnails(pending)
         except Exception:
             logging.exception("Could not clear completed pending entry for %s", video_id)
 
@@ -1210,10 +1342,72 @@ def show_title_popup(
         padx=10
     )
 
-    root.bind(
-        "<Return>",
-        lambda event: upload()
-    )
+    def apply_upload_mode():
+        is_forever = selected_game() == "forever"
+        if is_forever:
+            general_mode.set(True)
+        if general_mode.get():
+            mythic_frame.pack_forget()
+            general_frame.pack(before=button_frame)
+            root.geometry("620x750")
+            root.title("WoW Forever — Journey to 60" if is_forever else "Other WoW Video — Retail")
+            spec_label.config(text="Class/spec (optional):" if is_forever else "Spec (optional):")
+            other_button.config(text="Back to Mythic+")
+        else:
+            general_frame.pack_forget()
+            mythic_frame.pack(before=button_frame)
+            root.geometry("620x630")
+            root.title("New WoW Recording — Retail")
+            spec_label.config(text="Spec:")
+            other_button.config(text="Other WoW video…")
+        if is_forever:
+            other_button.pack_forget()
+        else:
+            other_button.pack(pady=(8, 12))
+        update_thumbnail_status()
+
+    def toggle_upload_mode():
+        if selected_game() == "forever":
+            return
+        general_mode.set(not general_mode.get())
+        apply_upload_mode()
+
+    other_button = tk.Button(root, text="Other WoW video…", width=25, command=toggle_upload_mode)
+    other_button.pack(pady=(8, 12))
+
+    def game_changed(event=None):
+        nonlocal characters, active_game
+        if active_game:
+            game_drafts[active_game] = (character_combo.get(), spec_combo.get(), general_mode.get())
+        active_game = selected_game()
+        characters = get_wow_characters(active_game)
+        values = [item["display"] for item in characters]
+        is_forever = active_game == "forever"
+        character_combo.config(values=([""] + values) if is_forever else values)
+        character_label.config(text="Character (optional until created):" if is_forever else "Character:")
+        spec_combo.config(values=[] if is_forever else SPECS, state="normal" if is_forever else "readonly")
+        profile = character_profile()
+        saved_character = profile.get("last_character", "")
+        draft = game_drafts.get(active_game)
+        selection = draft[0] if draft else saved_character
+        character_combo.set(selection if selection in values else ("" if is_forever or not values else values[0]))
+        character_changed()
+        if draft:
+            spec_combo.set(draft[1])
+        general_mode.set(True if is_forever else (draft[2] if draft else False))
+        apply_upload_mode()
+
+    game_combo.bind("<<ComboboxSelected>>", game_changed)
+    game_changed()
+
+    def enter_pressed(event):
+        # Enter inserts a newline while writing the optional description.
+        if event.widget is description_entry:
+            return
+        upload()
+        return "break"
+
+    root.bind("<Return>", enter_pressed)
 
     root.bind(
         "<Escape>",

@@ -1,5 +1,6 @@
 
 import os
+import uuid
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 # ============================================================
@@ -25,6 +26,106 @@ OUTPUT_FOLDER = os.path.join(
 
 WIDTH = 1280
 HEIGHT = 720
+
+GENERIC_TEMPLATES_FOLDER = os.path.join(TEMPLATES_FOLDER, "Generic")
+GENERIC_HEADLINE_LIMIT = 60
+GENERIC_HEADLINE_AREA = (665, 275, 1230, 625)
+GENERIC_MAX_LINES = 3
+GENERIC_MIN_FONT_SIZE = 44
+GENERIC_MAX_FONT_SIZE = 84
+
+
+def normalize_headline(text):
+    return " ".join(text.split())
+
+
+def get_generic_template(character, game_version="retail"):
+    if game_version not in ("retail", "forever"):
+        raise ValueError("Please select WoW Retail or WoW Forever.")
+    if game_version == "forever":
+        path = os.path.join(TEMPLATES_FOLDER, "Forever", "JourneyTo60-v3.png")
+        return path if os.path.isfile(path) else None
+    # Each generic image contains this character's name and artwork.
+    # Never use a different character's template as a fallback.
+    path = os.path.join(GENERIC_TEMPLATES_FOLDER, character + ".png")
+    return path if os.path.isfile(path) else None
+
+
+def layout_generic_headline(text):
+    text = normalize_headline(text)
+    if not text:
+        raise ValueError("Please enter a thumbnail headline or video title.")
+    if len(text) > GENERIC_HEADLINE_LIMIT:
+        raise ValueError(
+            f"Thumbnail headline must be {GENERIC_HEADLINE_LIMIT} characters or fewer. "
+            "Use a shorter thumbnail headline; your video title can stay longer."
+        )
+
+    text = text.upper()
+    draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    x1, y1, x2, y2 = GENERIC_HEADLINE_AREA
+    stroke = 3
+    width = x2 - x1 - 2 * stroke
+    for size in range(GENERIC_MAX_FONT_SIZE, GENERIC_MIN_FONT_SIZE - 1, -1):
+        font = get_font(size)
+        lines = []
+        line = ""
+        for word in text.split():
+            candidate = f"{line} {word}".strip()
+            if draw.textlength(candidate, font=font) <= width:
+                line = candidate
+            else:
+                if line:
+                    lines.append(line)
+                line = word
+        if line:
+            lines.append(line)
+        if len(lines) > GENERIC_MAX_LINES:
+            continue
+        if any(draw.textlength(line, font=font) > width for line in lines):
+            continue
+        rendered = "\n".join(lines)
+        spacing = round(size * 0.20)
+        bbox = draw.multiline_textbbox(
+            (0, 0), rendered, font=font, spacing=spacing,
+            align="center", stroke_width=stroke,
+        )
+        if bbox[2] - bbox[0] <= x2 - x1 and bbox[3] - bbox[1] <= y2 - y1:
+            return rendered, font, spacing, bbox
+    raise ValueError(
+        "This headline is too wide to stay readable. Use shorter words or a "
+        "shorter thumbnail headline; your video title can stay longer."
+    )
+
+
+def render_generic_thumbnail(character, headline, game_version="retail"):
+    template = get_generic_template(character, game_version)
+    if not template:
+        raise FileNotFoundError(f"No {game_version} thumbnail template for {character or 'this video'}.")
+    rendered, font, spacing, bbox = layout_generic_headline(headline)
+    with Image.open(template) as source:
+        image = ImageOps.fit(source.convert("RGB"), (WIDTH, HEIGHT))
+    x1, y1, x2, y2 = GENERIC_HEADLINE_AREA
+    position = (
+        round((x1 + x2 - bbox[0] - bbox[2]) / 2),
+        round((y1 + y2 - bbox[1] - bbox[3]) / 2),
+    )
+    ImageDraw.Draw(image).multiline_text(
+        position, rendered, font=font, spacing=spacing, align="center",
+        fill="#F3F7FF", stroke_width=3, stroke_fill="#061426",
+    )
+    return image
+
+
+def generate_generic_thumbnail(character, headline, game_version="retail"):
+    image = render_generic_thumbnail(character, headline, game_version)
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    path = os.path.join(OUTPUT_FOLDER, f"upload_{uuid.uuid4().hex}.jpg")
+    for quality in (92, 85, 75, 65, 55, 45):
+        image.save(path, "JPEG", quality=quality, optimize=True)
+        if os.path.getsize(path) <= 2_000_000:
+            return path
+    raise ValueError("Generated thumbnail exceeds 2 MB.")
 
 
 # ============================================================
