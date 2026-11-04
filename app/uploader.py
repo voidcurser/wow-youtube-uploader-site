@@ -1439,7 +1439,7 @@ def show_title_popup(
         if is_short:
             try:
                 conversion_status.config(text="Converting Short... Please wait; this may take a few minutes.")
-                root.update()
+                root.update_idletasks()
                 upload_path = make_vertical_short(file_path)
             except Exception as exc:
                 logging.exception("Short conversion failed; original recording kept")
