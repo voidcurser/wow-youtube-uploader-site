@@ -8,6 +8,10 @@ import queue
 import uuid
 import logging
 import faulthandler
+import math
+import shutil
+import subprocess
+import tempfile
 from contextlib import closing
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -45,7 +49,12 @@ WOW_ACCOUNT_FOLDER = os.path.join(
 WOW_FOREVER_ACCOUNT_FOLDER = os.path.join(
     os.path.dirname(WOW_RETAIL_FOLDER), "_forever_", "WTF", "Account"
 )
-GAME_LABELS = {"WoW Retail": "retail", "WoW Forever": "forever"}
+GAME_LABELS = {
+    "WoW Retail": "retail",
+    "WoW Forever": "forever",
+    "Azeroth Survivors": "survivors",
+}
+MAX_SHORT_SOURCE_SECONDS = 179.0  # Safety margin for encoder/container timing.
 
 CLIENT_SECRET_FILE = os.path.join(BASE_DIR, "client_secret.json")
 TOKEN_FILE = os.path.join(BASE_DIR, "token.json")
@@ -177,14 +186,26 @@ def get_role_from_spec(spec):
     return "DPS"
 
 
-def get_hashtags(spec, mythic_plus=True, game_version="retail"):
-    hashtags = ["#WorldOfWarcraft", "#WoW"]
+def get_hashtags(spec, mythic_plus=True, game_version="retail", is_short=False):
+    if game_version == "survivors":
+        hashtags = ["#AzerothSurvivors", "#Gaming", "#Gameplay"]
+        if is_short:
+            hashtags.append("#Shorts")
+        return " ".join(hashtags)
+
+    hashtags = [
+        "#WorldOfWarcraft", "#WoW", "#Warcraft", "#MMORPG",
+        "#WoWCommunity", "#BlizzardGames", "#WoWYouTuber",
+    ]
     if spec:
         hashtags.append("#" + spec.replace(" ", ""))
     if game_version == "forever":
         hashtags.extend(["#WoWForever", "#JourneyTo60", "#WoWLeveling"])
     else:
-        hashtags.append("#MythicPlus" if mythic_plus else "#WoWGameplay")
+        hashtags.extend(["#WoWMidnight", "#Midnight",
+                         "#MythicPlus" if mythic_plus else "#WoWGameplay"])
+    if is_short:
+        hashtags.append("#Shorts")
     if spec not in SPECS:
         return " ".join(hashtags)
     role = get_role_from_spec(spec)
@@ -202,9 +223,13 @@ def get_hashtags(spec, mythic_plus=True, game_version="retail"):
 
 
 def get_tags(spec, character, realm, mythic_plus=True, game_version="retail"):
+    if game_version == "survivors":
+        return ["Azeroth Survivors", "Azeroth Survivors gameplay", "Gaming", "Gameplay"]
     tags = [
         "World of Warcraft",
         "WoW",
+        "Warcraft",
+        "MMORPG",
         "WoW Gameplay",
         "WoW POV",
     ]
@@ -226,7 +251,12 @@ def get_tags(spec, character, realm, mythic_plus=True, game_version="retail"):
     return tags
 
 
-def build_description(character, realm, spec, notes="", mythic_plus=True, game_version="retail"):
+def build_description(character, realm, spec, notes="", mythic_plus=True,
+                      game_version="retail", is_short=False):
+    if game_version == "survivors":
+        sections = [notes.strip(), "Azeroth Survivors gameplay.",
+                    get_hashtags("", game_version=game_version, is_short=is_short)]
+        return "\n\n".join(part for part in sections if part) + "\n"
     details = []
     if character:
         details.append(f"Character: {character}")
@@ -239,7 +269,8 @@ def build_description(character, realm, spec, notes="", mythic_plus=True, game_v
     gameplay = ("World of Warcraft: Forever gameplay.\nJourney to level 60."
                 if game_version == "forever" else "World of Warcraft gameplay.")
     sections = [notes.strip(), gameplay, "\n".join(details),
-                get_hashtags(spec, mythic_plus=mythic_plus, game_version=game_version)]
+                get_hashtags(spec, mythic_plus=mythic_plus,
+                             game_version=game_version, is_short=is_short)]
     return "\n\n".join(section for section in sections if section) + "\n"
 
 
@@ -422,7 +453,9 @@ def save_settings(settings):
 def get_wow_characters(game_version="retail"):
     characters = []
     if game_version not in GAME_LABELS.values():
-        raise ValueError("Please select WoW Retail or WoW Forever.")
+        raise ValueError("Please select a supported game.")
+    if game_version == "survivors":
+        return characters
     account_folder = WOW_FOREVER_ACCOUNT_FOLDER if game_version == "forever" else WOW_ACCOUNT_FOLDER
     if not os.path.exists(account_folder):
         print(f"WoW {game_version} Account folder not found.")
@@ -612,6 +645,107 @@ def clean_filename(title):
 # YOUTUBE UPLOAD
 # ============================================================
 
+def _short_tools():
+    """Use FFmpeg on PATH or place ffmpeg.exe/ffprobe.exe beside uploader.py."""
+    found = []
+    for name in ("ffmpeg", "ffprobe"):
+        bundled = os.path.join(BASE_DIR, name + ".exe")
+        executable = bundled if os.path.isfile(bundled) else shutil.which(name)
+        if not executable:
+            raise RuntimeError(
+                "Short uploads require FFmpeg and FFprobe. Install both and restart "
+                "the uploader, or put ffmpeg.exe and ffprobe.exe beside uploader.py."
+            )
+        found.append(executable)
+    return found
+
+
+def _probe_video(file_path, ffprobe):
+    """Return (duration seconds, width, height) without loading the recording."""
+    result = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+         "format=duration:stream=width,height", "-of", "json", file_path],
+        capture_output=True, text=True, check=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    info = json.loads(result.stdout)
+    streams = info.get("streams") or []
+    if not streams:
+        raise ValueError("The recording has no video stream.")
+    duration = float(info.get("format", {}).get("duration", 0))
+    width = int(streams[0]["width"])
+    height = int(streams[0]["height"])
+    if not math.isfinite(duration) or duration <= 0 or width <= 0 or height <= 0:
+        raise ValueError("Could not determine the recording duration or dimensions.")
+    return duration, width, height
+
+
+def make_vertical_short(source_path):
+    """Keep all gameplay in focus over a blurred full-height 9:16 background.
+
+    Returns a distinct temporary MP4 outside Captures, preventing watchdog from
+    detecting the intermediate file as another new recording.
+    """
+    ffmpeg, ffprobe = _short_tools()
+    duration, _, _ = _probe_video(source_path, ffprobe)
+    if duration > MAX_SHORT_SOURCE_SECONDS:
+        raise ValueError(
+            f"This recording is {duration:.1f}s long. Shorts must be under "
+            "3 minutes. Please trim the original first; it was not changed."
+        )
+
+    file_descriptor, output_path = tempfile.mkstemp(prefix="youtube_short_", suffix=".mp4")
+    os.close(file_descriptor)
+    # The first copy fills the frame (blurred); the second is fully visible
+    # at original aspect ratio. Audio is copied from the original if present.
+    video_filter = (
+        "[0:v]split=2[background][gameplay];"
+        "[background]scale=1080:1920:force_original_aspect_ratio=increase,"
+        "crop=1080:1920,boxblur=24:1[blurred];"
+        "[gameplay]scale=1080:1920:force_original_aspect_ratio=decrease[visible];"
+        "[blurred][visible]overlay=(W-w)/2:(H-h)/2,setsar=1[outv]"
+    )
+    command = [
+        ffmpeg, "-hide_banner", "-nostdin", "-y", "-i", source_path,
+        "-filter_complex", video_filter, "-map", "[outv]", "-map", "0:a?",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k",
+        "-movflags", "+faststart", output_path,
+    ]
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if result.returncode:
+            raise RuntimeError("FFmpeg could not convert the Short:\n" + result.stderr[-1300:])
+        output_duration, width, height = _probe_video(output_path, ffprobe)
+        if (width, height) != (1080, 1920) or output_duration > 180:
+            raise RuntimeError("FFmpeg produced a video that is not a valid 9:16 Short.")
+        logging.info("Prepared vertical Short: %s -> %s", source_path, output_path)
+        return output_path
+    except Exception:
+        if os.path.isfile(output_path):
+            os.remove(output_path)
+        raise
+
+
+def build_video_upload_body(title, description, tags):
+    """Public gaming uploads are not child-directed by default."""
+    return {
+        "snippet": {
+            "title": title,
+            "description": description,
+            "categoryId": "20",
+            "tags": tags,
+        },
+        "status": {
+            "privacyStatus": "public",
+            "selfDeclaredMadeForKids": False,
+        },
+    }
+
+
 def upload_video(
     youtube,
     file_path,
@@ -622,9 +756,10 @@ def upload_video(
     notes="",
     mythic_plus=True,
     game_version="retail",
+    is_short=False,
 ):
     if game_version not in GAME_LABELS.values():
-        raise ValueError("Please select WoW Retail or WoW Forever.")
+        raise ValueError("Please select a supported game.")
     if game_version == "forever":
         mythic_plus = False
     print()
@@ -638,20 +773,10 @@ def upload_video(
         mythic_plus=mythic_plus,
         game_version=game_version,
     )
-    description = build_description(character, realm, spec, notes, mythic_plus, game_version)
+    description = build_description(character, realm, spec, notes, mythic_plus,
+                                    game_version, is_short=is_short)
 
-    body = {
-        "snippet": {
-            "title": title,
-            "description": description,
-            "categoryId": "20",
-            "tags": tags
-        },
-
-        "status": {
-            "privacyStatus": "public"
-        }
-    }
+    body = build_video_upload_body(title, description, tags)
 
     # Upload in 8 MiB chunks instead of sending the entire recording as one
     # chunk. This allows the same resumable session to continue after a brief
@@ -812,6 +937,8 @@ def show_title_popup(
 ):
     settings = load_settings()
     initial_game = settings.get("last_game_version", "retail")
+    if "azeroth survivors" in os.path.basename(file_path).lower():
+        initial_game = "survivors"
     if initial_game not in GAME_LABELS.values():
         initial_game = "retail"
     characters = get_wow_characters(initial_game)
@@ -821,11 +948,11 @@ def show_title_popup(
     root = tk.Tk()
 
     root.title(
-        "New WoW Recording"
+        "New Game Recording"
     )
 
     root.geometry(
-        "620x670"
+        "620x720"
     )
 
     root.resizable(
@@ -872,12 +999,20 @@ def show_title_popup(
                               values=list(GAME_LABELS), state="readonly", width=24)
     game_combo.pack(side="left")
 
+    short_mode = tk.BooleanVar(root, value=False)
+    tk.Checkbutton(
+        root, text="Upload as YouTube Short (vertical 9:16, max 3 min)",
+        variable=short_mode, command=lambda: update_thumbnail_status(),
+    ).pack(pady=(0, 10))
+
     def selected_game():
         return GAME_LABELS[game_var.get()]
 
     def character_profile():
         if selected_game() == "retail":
             return settings
+        if selected_game() == "survivors":
+            return settings.setdefault("survivors", {"last_character": "", "character_specs": {}})
         return settings.setdefault("forever", {"last_character": "", "character_specs": {}})
 
 
@@ -906,8 +1041,11 @@ def show_title_popup(
 
     # CHARACTER
 
+    character_frame = tk.Frame(root)
+    character_frame.pack(after=title_entry)
+
     character_label = tk.Label(
-        root,
+        character_frame,
         text="Character:"
     )
     character_label.pack()
@@ -918,7 +1056,7 @@ def show_title_popup(
     ]
 
     character_combo = ttk.Combobox(
-        root,
+        character_frame,
         values=character_values,
         state="readonly",
         width=55
@@ -932,13 +1070,13 @@ def show_title_popup(
     # SPEC
 
     spec_label = tk.Label(
-        root,
+        character_frame,
         text="Spec:"
     )
     spec_label.pack()
 
     spec_combo = ttk.Combobox(
-        root,
+        character_frame,
         values=SPECS,
         state="readonly",
         width=55
@@ -1000,15 +1138,23 @@ def show_title_popup(
         )
 
     def update_thumbnail_status():
-        available = bool(get_generic_template(selected_character_name(), selected_game()))
+        game_version = selected_game()
+        if short_mode.get():
+            status = "Short: the whole gameplay is kept over a blurred vertical background. YouTube selects its thumbnail."
+            available = False
+        elif game_version == "survivors":
+            status = "Azeroth Survivors: generic description and game tags. YouTube selects its thumbnail."
+            available = False
+        else:
+            available = bool(get_generic_template(selected_character_name(), game_version))
+            if game_version == "forever":
+                status = ("Forever: Journey to 60 thumbnail and hashtags. Character artwork can be added later."
+                          if available else "Forever thumbnail is missing. Restore the approved template before uploading.")
+            else:
+                status = ("Character thumbnail available. WoW hashtags are added automatically."
+                          if available else "No generic template for this character yet. Uploads without a custom thumbnail.")
         headline_entry.config(state="normal" if available else "disabled")
         preview_button.config(state="normal" if available else "disabled")
-        if selected_game() == "forever":
-            status = ("Forever: Journey to 60 thumbnail and hashtags. Character artwork can be added later."
-                      if available else "Forever thumbnail is missing. Restore the approved template before uploading.")
-        else:
-            status = ("Character thumbnail available. WoW hashtags are added automatically."
-                      if available else "No generic template for this character yet. Uploads without a custom thumbnail.")
         thumbnail_status.config(text=status)
         update_headline_hint()
 
@@ -1115,7 +1261,9 @@ def show_title_popup(
         key_raw = key_entry.get().strip()
         game_version = selected_game()
         is_forever = game_version == "forever"
-        is_general = general_mode.get() or is_forever
+        is_survivors = game_version == "survivors"
+        is_general = general_mode.get() or is_forever or is_survivors
+        is_short = short_mode.get()
         if not is_general:
             if selected_dungeon not in DUNGEON_IDS:
                 messagebox.showwarning("Missing dungeon", "Please select a dungeon.")
@@ -1138,7 +1286,7 @@ def show_title_popup(
 
             return
 
-        if not selected_character and not is_forever:
+        if not selected_character and not (is_forever or is_survivors):
 
             messagebox.showwarning(
                 "Missing character",
@@ -1165,7 +1313,7 @@ def show_title_popup(
             None
         )
 
-        if not character_data and (selected_character or not is_forever):
+        if not character_data and (selected_character or not (is_forever or is_survivors)):
 
             messagebox.showerror(
                 "Character error",
@@ -1255,7 +1403,9 @@ def show_title_popup(
         # a video without its requested thumbnail. Do not touch base templates.
         thumbnail_path = None
         try:
-            if is_general:
+            if is_short or is_survivors:
+                thumbnail_path = None
+            elif is_general:
                 if is_forever or get_generic_template(character, game_version):
                     thumbnail_path = generate_generic_thumbnail(character, effective_headline(), game_version)
             else:
@@ -1283,6 +1433,25 @@ def show_title_popup(
             )
             return
 
+        # Convert before renaming, so a failed conversion never alters the
+        # original recording's name or contents.
+        upload_path = None
+        if is_short:
+            try:
+                conversion_status.config(text="Converting Short... Please wait; this may take a few minutes.")
+                root.update()
+                upload_path = make_vertical_short(file_path)
+            except Exception as exc:
+                logging.exception("Short conversion failed; original recording kept")
+                messagebox.showerror(
+                    "Short conversion failed",
+                    f"{exc}\n\nThe original recording was kept and was NOT uploaded.",
+                    parent=root,
+                )
+                conversion_status.config(text="")
+                return
+
+        rename_completed = False
         try:
             save_settings(settings)
             if new_path != file_path:
@@ -1291,14 +1460,24 @@ def show_title_popup(
                         "File already exists",
                         "A recording with this name already exists."
                     )
-                    # Keep the generated thumbnail for diagnosis.
                     return
                 os.rename(file_path, new_path)
                 file_path = new_path
+            rename_completed = True
         except Exception as e:
             logging.exception("Could not rename video")
             messagebox.showerror("File error", str(e))
             return
+        finally:
+            # If the rename failed, discard the encoded temp but keep source.
+            if not rename_completed and upload_path and os.path.isfile(upload_path):
+                try:
+                    os.remove(upload_path)
+                except OSError:
+                    logging.exception("Could not clean up unused Short: %s", upload_path)
+
+        if not is_short:
+            upload_path = new_path
 
         # Persist uncertainty BEFORE the first network request. A native crash
         # cannot be caught by the Python exception handler.
@@ -1306,15 +1485,18 @@ def show_title_popup(
             record_upload_state(new_path, youtube_title, "uploading")
         except Exception as exc:
             logging.exception("Cannot persist upload state; upload not started")
+            if upload_path != new_path and os.path.isfile(upload_path):
+                os.remove(upload_path)
             messagebox.showerror("Upload safety error", str(exc), parent=root)
             return
 
         root.destroy()
         try:
             video_id = upload_video(
-                youtube, new_path, youtube_title, character, realm, selected_spec,
+                youtube, upload_path, youtube_title, character, realm, selected_spec,
                 notes=notes, mythic_plus=not is_general,
                 game_version=game_version,
+                is_short=is_short,
             )
         except Exception as exc:
             logging.exception("Video upload failed: %s", new_path)
@@ -1334,6 +1516,14 @@ def show_title_popup(
                 "See uploader.log for details."
             )
             return
+        finally:
+            # The encoded file is disposable; the original MP4 remains until
+            # upload success and any requested thumbnail are confirmed.
+            if upload_path != new_path and os.path.isfile(upload_path):
+                try:
+                    os.remove(upload_path)
+                except OSError:
+                    logging.exception("Could not remove temporary Short: %s", upload_path)
 
         try:
             record_upload_state(new_path, youtube_title, "uploaded", video_id)
@@ -1426,6 +1616,9 @@ def show_title_popup(
         root
     )
 
+    conversion_status = tk.Label(root, text="", fg="#075985", wraplength=570)
+    conversion_status.pack(pady=(0, 2))
+
     button_frame.pack(
         pady=5
     )
@@ -1460,30 +1653,36 @@ def show_title_popup(
 
     def apply_upload_mode():
         is_forever = selected_game() == "forever"
-        if is_forever:
+        is_survivors = selected_game() == "survivors"
+        if is_forever or is_survivors:
             general_mode.set(True)
+        if is_survivors:
+            character_frame.pack_forget()
+        else:
+            character_frame.pack(after=title_entry)
         if general_mode.get():
             mythic_frame.pack_forget()
             general_frame.pack(before=button_frame)
-            root.geometry("620x790")
-            root.title("WoW Forever — Journey to 60" if is_forever else "Other WoW Video — Retail")
+            root.geometry("620x840")
+            root.title("Azeroth Survivors Recording" if is_survivors else
+                       "WoW Forever — Journey to 60" if is_forever else "Other WoW Video — Retail")
             spec_label.config(text="Class/spec (optional):" if is_forever else "Spec (optional):")
             other_button.config(text="Back to Mythic+")
         else:
             general_frame.pack_forget()
             mythic_frame.pack(before=button_frame)
-            root.geometry("620x670")
+            root.geometry("620x720")
             root.title("New WoW Recording — Retail")
             spec_label.config(text="Spec:")
             other_button.config(text="Other WoW video…")
-        if is_forever:
+        if is_forever or is_survivors:
             other_button.pack_forget()
         else:
             other_button.pack(pady=(8, 12))
         update_thumbnail_status()
 
     def toggle_upload_mode():
-        if selected_game() == "forever":
+        if selected_game() in ("forever", "survivors"):
             return
         general_mode.set(not general_mode.get())
         apply_upload_mode()
@@ -1499,18 +1698,20 @@ def show_title_popup(
         characters = get_wow_characters(active_game)
         values = [item["display"] for item in characters]
         is_forever = active_game == "forever"
+        is_survivors = active_game == "survivors"
         character_combo.config(values=([""] + values) if is_forever else values)
         character_label.config(text="Character (optional until created):" if is_forever else "Character:")
-        spec_combo.config(values=[] if is_forever else SPECS, state="normal" if is_forever else "readonly")
+        spec_combo.config(values=[] if is_forever or is_survivors else SPECS,
+                          state="normal" if is_forever else "readonly")
         profile = character_profile()
         saved_character = profile.get("last_character", "")
         draft = game_drafts.get(active_game)
         selection = draft[0] if draft else saved_character
-        character_combo.set(selection if selection in values else ("" if is_forever or not values else values[0]))
+        character_combo.set(selection if selection in values else ("" if is_forever or is_survivors or not values else values[0]))
         character_changed()
         if draft:
             spec_combo.set(draft[1])
-        general_mode.set(True if is_forever else (draft[2] if draft else False))
+        general_mode.set(True if is_forever or is_survivors else (draft[2] if draft else False))
         apply_upload_mode()
 
     game_combo.bind("<<ComboboxSelected>>", game_changed)
