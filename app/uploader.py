@@ -4,8 +4,10 @@ import os
 import time
 import json
 import threading
+import queue
 import uuid
 import logging
+import faulthandler
 from contextlib import closing
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -50,6 +52,7 @@ TOKEN_FILE = os.path.join(BASE_DIR, "token.json")
 UPLOADED_FILE = os.path.join(BASE_DIR, "uploaded.json")
 SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 PENDING_THUMBNAILS_FILE = os.path.join(BASE_DIR, "pending_thumbnails.json")
+UPLOAD_JOURNAL_FILE = os.path.join(BASE_DIR, "upload_journal.json")
 
 DUNGEONS = [
     ("Altar of Fangs", "AltarOfFangs"),
@@ -494,24 +497,59 @@ def load_uploaded():
             "r",
             encoding="utf-8"
         ) as f:
-            return json.load(f)
-
-    except Exception:
-        return []
+            uploaded = json.load(f)
+        if not isinstance(uploaded, list):
+            raise ValueError("uploaded.json must contain a JSON list")
+        return uploaded
+    except Exception as exc:
+        logging.exception("Upload history unreadable; refusing unsafe reuploads")
+        raise RuntimeError(
+            "uploaded.json could not be read. Fix the file before restarting "
+            "to avoid duplicate uploads."
+        ) from exc
 
 
 def save_uploaded(uploaded):
-    with open(
-        UPLOADED_FILE,
-        "w",
-        encoding="utf-8"
-    ) as f:
+    # A native crash must not leave a truncated history and cause reuploads.
+    temporary = UPLOADED_FILE + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as f:
+        json.dump(uploaded, f, indent=2)
+    os.replace(temporary, UPLOADED_FILE)
 
-        json.dump(
-            uploaded,
-            f,
-            indent=2
-        )
+
+def load_upload_journal():
+    """Videos with an uncertain outcome must never be silently retried."""
+    if not os.path.isfile(UPLOAD_JOURNAL_FILE):
+        return {}
+    with open(UPLOAD_JOURNAL_FILE, "r", encoding="utf-8") as f:
+        journal = json.load(f)
+    if not isinstance(journal, dict):
+        raise ValueError("upload_journal.json must contain a JSON object")
+    return journal
+
+
+def save_upload_journal(journal):
+    temporary = UPLOAD_JOURNAL_FILE + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as f:
+        json.dump(journal, f, indent=2, ensure_ascii=False)
+    os.replace(temporary, UPLOAD_JOURNAL_FILE)
+
+
+def record_upload_state(path, title, state, video_id=None):
+    journal = load_upload_journal()
+    journal[os.path.normcase(os.path.abspath(path))] = {
+        "title": title,
+        "state": state,
+        "video_id": video_id,
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    save_upload_journal(journal)
+
+
+def clear_upload_state(path):
+    journal = load_upload_journal()
+    journal.pop(os.path.normcase(os.path.abspath(path)), None)
+    save_upload_journal(journal)
 
 
 # ============================================================
@@ -787,7 +825,7 @@ def show_title_popup(
     )
 
     root.geometry(
-        "620x630"
+        "620x670"
     )
 
     root.resizable(
@@ -818,6 +856,13 @@ def show_title_popup(
     ).pack(
         pady=(15, 12)
     )
+
+    tk.Label(
+        root,
+        text=os.path.basename(file_path),
+        fg="#555555",
+        wraplength=580,
+    ).pack(pady=(0, 8))
 
     game_frame = tk.Frame(root)
     game_frame.pack(pady=(0, 12))
@@ -1051,6 +1096,7 @@ def show_title_popup(
     # UPLOAD
 
     def upload():
+        nonlocal file_path
         base_title = (
             title_entry
             .get()
@@ -1168,6 +1214,42 @@ def show_title_popup(
             ),
             safe_filename + ".mp4"
         )
+        original_path = file_path
+
+        # The previous process may have crashed after YouTube created a video.
+        # Never start a new upload for a known successful video, and require
+        # explicit confirmation for a previous upload with an unknown outcome.
+        try:
+            journal = load_upload_journal()
+            # A user may change the title after restarting. Check the actual
+            # source file too, not just the future renamed destination.
+            old_attempt = (
+                journal.get(os.path.normcase(os.path.abspath(file_path)))
+                or journal.get(os.path.normcase(os.path.abspath(new_path)))
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            logging.exception("Cannot read upload journal safely")
+            messagebox.showerror("Upload history error", str(exc), parent=root)
+            return
+        if old_attempt and old_attempt.get("video_id"):
+            messagebox.showerror(
+                "Video already uploaded",
+                "This recording has an existing YouTube video ID:\n"
+                f"{old_attempt['video_id']}\n\n"
+                "Check YouTube Studio. This app will not upload it twice.",
+                parent=root,
+            )
+            return
+        if old_attempt and not messagebox.askyesno(
+            "Previous upload may exist",
+            "An earlier upload of this recording was interrupted. YouTube "
+            "may already have received it.\n\n"
+            "Have you checked YouTube Studio and confirmed that a NEW "
+            "upload is needed?",
+            parent=root,
+            default=messagebox.NO,
+        ):
+            return
 
         # Prepare thumbnail BEFORE uploading so missing assets don't create
         # a video without its requested thumbnail. Do not touch base templates.
@@ -1212,9 +1294,19 @@ def show_title_popup(
                     # Keep the generated thumbnail for diagnosis.
                     return
                 os.rename(file_path, new_path)
+                file_path = new_path
         except Exception as e:
             logging.exception("Could not rename video")
             messagebox.showerror("File error", str(e))
+            return
+
+        # Persist uncertainty BEFORE the first network request. A native crash
+        # cannot be caught by the Python exception handler.
+        try:
+            record_upload_state(new_path, youtube_title, "uploading")
+        except Exception as exc:
+            logging.exception("Cannot persist upload state; upload not started")
+            messagebox.showerror("Upload safety error", str(exc), parent=root)
             return
 
         root.destroy()
@@ -1226,6 +1318,10 @@ def show_title_popup(
             )
         except Exception as exc:
             logging.exception("Video upload failed: %s", new_path)
+            try:
+                record_upload_state(new_path, youtube_title, "needs_review")
+            except Exception:
+                logging.exception("Cannot mark upload for manual review")
             print("Video upload failed. Local files were retained.")
             logging.error("Local files retained for manual recovery: %s | %s", new_path, thumbnail_path)
             show_error_dialog(
@@ -1238,6 +1334,11 @@ def show_title_popup(
                 "See uploader.log for details."
             )
             return
+
+        try:
+            record_upload_state(new_path, youtube_title, "uploaded", video_id)
+        except Exception:
+            logging.exception("Uploaded video ID %s could not be journaled", video_id)
 
         # The video was created. Record its ID BEFORE attempting the thumbnail;
         # a thumbnail failure must never trigger a second video upload.
@@ -1260,6 +1361,13 @@ def show_title_popup(
                 video_id, video_id
             )
             return
+
+        try:
+            clear_upload_state(new_path)
+            if original_path != new_path:
+                clear_upload_state(original_path)
+        except Exception:
+            logging.exception("Could not clear upload journal for %s", video_id)
 
         while thumbnail_path:
             try:
@@ -1342,6 +1450,14 @@ def show_title_popup(
         padx=10
     )
 
+    # Unlike Skip, Later keeps the file eligible for recovery on next launch.
+    tk.Button(
+        button_frame,
+        text="Later",
+        width=12,
+        command=root.destroy,
+    ).pack(side="left", padx=5)
+
     def apply_upload_mode():
         is_forever = selected_game() == "forever"
         if is_forever:
@@ -1349,14 +1465,14 @@ def show_title_popup(
         if general_mode.get():
             mythic_frame.pack_forget()
             general_frame.pack(before=button_frame)
-            root.geometry("620x750")
+            root.geometry("620x790")
             root.title("WoW Forever — Journey to 60" if is_forever else "Other WoW Video — Retail")
             spec_label.config(text="Class/spec (optional):" if is_forever else "Spec (optional):")
             other_button.config(text="Back to Mythic+")
         else:
             general_frame.pack_forget()
             mythic_frame.pack(before=button_frame)
-            root.geometry("620x630")
+            root.geometry("620x670")
             root.title("New WoW Recording — Retail")
             spec_label.config(text="Spec:")
             other_button.config(text="Other WoW video…")
@@ -1434,6 +1550,29 @@ class RecordingHandler(
     ):
         self.youtube = youtube
         self.uploaded = uploaded
+        self.pending = queue.Queue()
+        self._queued_paths = set()
+        self._queue_lock = threading.Lock()
+
+    def enqueue_path(self, file_path, reason="watchdog"):
+        """Watchdog only enqueues paths; it must never create a Tk window."""
+        if not file_path.lower().endswith(".mp4"):
+            return False
+        file_path = os.path.abspath(file_path)
+        key = os.path.normcase(file_path)
+        with self._queue_lock:
+            known = {os.path.normcase(os.path.abspath(path)) for path in self.uploaded}
+            if key in known or key in self._queued_paths:
+                return False
+            self._queued_paths.add(key)
+        self.pending.put(file_path)
+        logging.info("Recording queued (%s): %s", reason, file_path)
+        return True
+
+    def completed_path(self, file_path):
+        with self._queue_lock:
+            self._queued_paths.discard(os.path.normcase(os.path.abspath(file_path)))
+        self.pending.task_done()
 
     def on_created(
         self,
@@ -1441,46 +1580,62 @@ class RecordingHandler(
     ):
         if event.is_directory:
             return
+        self.enqueue_path(event.src_path)
 
-        file_path = (
-            event.src_path
-        )
-
-        if not file_path.lower().endswith(
-            ".mp4"
-        ):
+    def on_moved(self, event):
+        if event.is_directory:
             return
+        # A recording deliberately moved OUT and BACK IN may be recovered.
+        # Do not treat our own in-folder rename as a new recording.
+        source_parent = os.path.normcase(os.path.abspath(os.path.dirname(event.src_path)))
+        watch_parent = os.path.normcase(os.path.abspath(WATCH_FOLDER))
+        if source_parent != watch_parent:
+            self.enqueue_path(event.dest_path, reason="moved into Captures")
 
-        if file_path in self.uploaded:
-            return
 
-        print()
-        print(
-            "New recording detected:"
+def offer_existing_recordings(handler):
+    """Recover after a crash only with explicit user approval (no auto-reupload)."""
+    existing = []
+    journal = load_upload_journal()
+    known = {os.path.normcase(os.path.abspath(p)) for p in handler.uploaded}
+    for name in sorted(os.listdir(WATCH_FOLDER)):
+        if name.lower().endswith(".mp4"):
+            path = os.path.join(WATCH_FOLDER, name)
+            key = os.path.normcase(os.path.abspath(path))
+            if journal.get(key, {}).get("video_id"):
+                logging.warning(
+                    "Not requeuing %s: already has YouTube video ID %s",
+                    path, journal[key]["video_id"],
+                )
+            elif key not in known:
+                existing.append(path)
+    if not existing:
+        return
+
+    logging.warning("Found %s pre-existing recordings not in uploaded history", len(existing))
+    examples = "\n".join("  " + os.path.basename(p) for p in existing[:5])
+    if len(existing) > 5:
+        examples += f"\n  ... and {len(existing) - 5} more"
+    dialog = tk.Tk()
+    dialog.withdraw()
+    dialog.attributes("-topmost", True)
+    try:
+        approved = messagebox.askyesno(
+            "YouTube Uploader - Recover recordings?",
+            f"Found {len(existing)} recordings left in Captures:\n\n{examples}\n\n"
+            "Some may have reached YouTube before the previous crash. "
+            "Check YouTube Studio before uploading one again.\n\n"
+            "Queue these files for review? Uploads will only start if you "
+            "choose Upload in each recording window. Use Later to leave a "
+            "file untouched. Default is No.",
+            parent=dialog,
+            default=messagebox.NO,
         )
-
-        print(
-            file_path
-        )
-
-        threading.Thread(
-            target=self.process_recording,
-            args=(file_path,),
-            daemon=True
-        ).start()
-
-    def process_recording(
-        self,
-        file_path
-    ):
-        if wait_until_finished(
-            file_path
-        ):
-            show_title_popup(
-                file_path,
-                self.youtube,
-                self.uploaded
-            )
+    finally:
+        dialog.destroy()
+    if approved:
+        for path in existing:
+            handler.enqueue_path(path, reason="approved crash recovery")
 
 
 # ============================================================
@@ -1488,6 +1643,7 @@ class RecordingHandler(
 # ============================================================
 
 def main():
+    logging.info("Uploader process started: pid=%s, executable=%s", os.getpid(), sys.executable)
     print(
         "Connecting to YouTube..."
     )
@@ -1544,15 +1700,40 @@ def main():
     observer.start()
 
     try:
-
+        # Watchdog runs on its own thread. Tkinter, all popups, and the YouTube
+        # API client run exclusively on this main thread, one recording at a time.
+        offer_existing_recordings(event_handler)
         while True:
-            time.sleep(1)
+            try:
+                file_path = event_handler.pending.get(timeout=1)
+            except queue.Empty:
+                continue
+
+            try:
+                if file_path in uploaded or not os.path.isfile(file_path):
+                    continue
+                if not wait_until_finished(file_path):
+                    logging.warning("Recording disappeared while waiting: %s", file_path)
+                    continue
+                logging.info("Opening recording popup: %s", file_path)
+                show_title_popup(file_path, youtube, uploaded)
+            except Exception as exc:
+                logging.exception("Could not process recording: %s", file_path)
+                show_error_dialog(
+                    "YouTube Uploader - Recording error",
+                    f"Could not handle {os.path.basename(file_path)}:\n"
+                    f"{type(exc).__name__}: {exc}\n\n"
+                    "The local recording was not intentionally deleted. "
+                    "Check uploader.log and restart to review the recording again.",
+                )
+            finally:
+                event_handler.completed_path(file_path)
 
     except KeyboardInterrupt:
-
+        logging.info("Uploader stopped via KeyboardInterrupt")
+    finally:
         observer.stop()
-
-    observer.join()
+        observer.join()
 
 
 if __name__ == "__main__":
@@ -1576,6 +1757,10 @@ if __name__ == "__main__":
         format="%(asctime)s %(levelname)s %(message)s",
         encoding="utf-8",
     )
+    # A native crash (e.g. 0xc0000005 in Tk/ntdll) bypasses normal Python
+    # exceptions. Keep a dedicated traceback of all Python threads for it.
+    crash_log = open(os.path.join(BASE_DIR, "uploader_crash.log"), "a", encoding="utf-8")
+    faulthandler.enable(file=crash_log, all_threads=True)
     try:
         main()
     except Exception as exc:
@@ -1589,4 +1774,6 @@ if __name__ == "__main__":
         )
         raise
     finally:
+        faulthandler.disable()
+        crash_log.close()
         ctypes.windll.kernel32.CloseHandle(mutex)
