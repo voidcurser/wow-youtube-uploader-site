@@ -2,12 +2,15 @@
 client_secret.json
 token.json
 token_old.json
+token_revoked_*.json
 *credentials*.json
 
 # Local application data
 uploaded.json
 settings.json
 pending_thumbnails.json
+upload_journal.json
+*.tmp
 
 # Logs
 *.log
