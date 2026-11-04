@@ -189,6 +189,7 @@ class PopupTests(unittest.TestCase):
                 patch.object(uploader, "get_wow_characters", side_effect=scan_characters),
                 patch.object(uploader, "load_settings", return_value=settings_data),
                 patch.object(uploader, "save_settings") as settings_save,
+                patch.object(uploader, "UPLOAD_JOURNAL_FILE", str(Path(folder) / "upload_journal.json")),
                 patch.object(uploader, "save_uploaded") as history_save,
                 patch.object(uploader, "load_pending_thumbnails", side_effect=lambda: dict(pending)),
                 patch.object(uploader, "save_pending_thumbnails", side_effect=pending_save),
